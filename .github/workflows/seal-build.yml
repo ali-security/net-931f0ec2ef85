@@ -1,0 +1,114 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated top-level test names to run (empty = full suite)"
+        required: false
+        default: ""
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GOTOOLCHAIN: local
+      MODULE_PATH: golang.org/x/net
+      MODULE_VERSION: v0.45.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: false
+
+      - name: Produce module zip (golang.org/x/mod/zip.CreateFromDir)
+        run: |
+          set -euo pipefail
+          # Copy the module tree without this workflow file, so the zip keeps the
+          # public member set (upstream ships no .github directory).
+          SRC="$RUNNER_TEMP/modsrc"
+          mkdir -p "$SRC"
+          rsync -a --exclude '.git' "$GITHUB_WORKSPACE/" "$SRC/"
+          rm -f "$SRC/.github/workflows/seal-build.yml"
+          if [ -d "$SRC/.github" ]; then find "$SRC/.github" -depth -type d -empty -delete; fi
+          HELPER="$RUNNER_TEMP/ziphelper"
+          mkdir -p "$HELPER"
+          cat > "$HELPER/main.go" <<'EOF'
+          package main
+
+          import (
+                  "log"
+                  "os"
+
+                  "golang.org/x/mod/module"
+                  "golang.org/x/mod/zip"
+          )
+
+          func main() {
+                  if len(os.Args) != 5 {
+                      log.Fatal("usage: zip-helper <module-path> <version> <source-dir> <output-zip>")
+                  }
+                  m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+                  f, err := os.Create(os.Args[4])
+                  if err != nil {
+                      log.Fatal(err)
+                  }
+                  defer f.Close()
+                  if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                      log.Fatal(err)
+                  }
+                  log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          OUT="$RUNNER_TEMP/build_output"
+          mkdir -p "$OUT"
+          cd "$HELPER"
+          go mod init example.com/ziphelper
+          go get golang.org/x/mod@v0.28.0
+          go run . "$MODULE_PATH" "$MODULE_VERSION" "$SRC" "$OUT/$MODULE_VERSION.zip"
+          unzip -l "$OUT/$MODULE_VERSION.zip" | tail -n 1
+
+      - name: Build
+        run: |
+          go version
+          go build ./...
+
+      - name: Configure loopback networking for the ipv4/ipv6/icmp tests
+        run: |
+          set -euxo pipefail
+          # The runner VM ships with IPv6 disabled and a non-multicast loopback;
+          # the ipv4/ipv6/icmp/nettest suites skip without these.
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0
+          sudo sysctl -w net.ipv6.conf.default.disable_ipv6=0
+          sudo sysctl -w net.ipv6.conf.lo.disable_ipv6=0
+          ip -6 addr show dev lo | grep -q '::1' || sudo ip -6 addr add ::1/128 dev lo
+          sudo ip link set lo multicast on
+          # Non-privileged ICMP sockets (icmp.TestConcurrentNonPrivilegedListenPacket).
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+          ip addr show dev lo
+
+      - name: Test
+        run: |
+          set -o pipefail
+          # Test binaries run as root (sudo -E keeps the job env) so the raw-socket
+          # tests in icmp/ipv4/ipv6/route execute instead of skipping on EPERM.
+          FILTER="${{ inputs.test-filter }}"
+          if [ -n "$FILTER" ]; then
+            go test -exec "sudo -E" -v -run "^($(echo "$FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/scoped.log"
+            for t in $FILTER; do grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/scoped.log" || { echo "selected test $t did not run"; exit 1; }; done
+          else
+            go test -exec "sudo -E" -v ./... 2>&1 | tee "$RUNNER_TEMP/full.log"
+            echo "---- skipped tests (name and reason) ----"
+            awk '/_test\.go:[0-9]+:/ { reason = $0 } /^[[:space:]]*--- SKIP/ { print; print "        reason:" reason }' "$RUNNER_TEMP/full.log"
+            awk '/^[[:space:]]*--- PASS/ {p++} /^[[:space:]]*--- FAIL/ {f++} /^[[:space:]]*--- SKIP/ {s++} END { printf "TEST SUMMARY: %d passed, %d failed, %d skipped\n", p, f, s }' "$RUNNER_TEMP/full.log"
+          fi
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/build_output/*.zip
+          if-no-files-found: error
